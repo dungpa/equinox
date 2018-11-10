@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netcoreapp2.1</TargetFramework>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="InventoryItem.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Equinox.Codec\Equinox.Codec.fsproj" />
+    <ProjectReference Include="..\..\src\Equinox\Equinox.fsproj" />
+  </ItemGroup>
+
+</Project>
