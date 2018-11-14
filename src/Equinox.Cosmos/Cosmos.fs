@@ -11,6 +11,57 @@ open Serilog
 open System
 
 [<AutoOpen>]
+module JsonExtensions =
+    /// Manages injecting prepared json into the data being submitted to DocDb as-is, on the basis we can trust it to be valid json as DocDb will need it to be
+    type VerbatimUtf8JsonConverter() =
+        inherit JsonConverter()
+
+        override __.ReadJson(reader, _, _, _) =
+            let token = JToken.Load(reader)
+            if token.Type = JTokenType.Object then token.ToString() |> System.Text.Encoding.UTF8.GetBytes |> box
+            else Array.empty<byte> |> box
+
+        override __.CanConvert(objectType) =
+            typeof<byte[]>.Equals(objectType)
+
+        override __.WriteJson(writer, value, serializer) =
+            let array = value :?> byte[]
+            if array = null || Array.length array = 0 then serializer.Serialize(writer, null)
+            else writer.WriteRawValue(System.Text.Encoding.UTF8.GetString(array))
+
+    /// Manages zipping of the UTF-8 json bytes to make the index record minimal from the perspective of the writer stored proc
+    /// Only applied to snapshots in the Index
+    open System.IO
+    open System.IO.Compression
+    type Base64ZipUtf8JsonConverter() =
+        inherit JsonConverter()
+        let pickle (input : byte[]) : string =
+            if input = null then null else
+
+            use output = new MemoryStream()
+            use compressor = new DeflateStream(output, CompressionLevel.Optimal)
+            compressor.Write(input,0,input.Length)
+            Convert.ToBase64String(output.ToArray())
+        let unpickle str : byte[] =
+            if str = null then null else
+
+            let compressedBytes = Convert.FromBase64String str
+            use input = new MemoryStream(compressedBytes)
+            use decompressor = new DeflateStream(input, CompressionMode.Decompress)
+            use output = new MemoryStream()
+            decompressor.CopyTo(output)
+            output.ToArray()
+
+        override __.CanConvert(objectType) =
+            typeof<byte[]>.Equals(objectType)
+        override __.ReadJson(reader, _, _, serializer) =
+            //(   if reader.TokenType = JsonToken.Null then null else
+            serializer.Deserialize(reader, typedefof<string>) :?> string |> unpickle |> box
+        override __.WriteJson(writer, value, serializer) =
+            let pickled = value |> unbox |> pickle
+            serializer.Serialize(writer, pickled)
+
+[<AutoOpen>]
 module private DocDbExtensions =
     /// Extracts the innermost exception from a nested hierarchy of Aggregate Exceptions
     let (|AggregateException|) (exn : exn) =
@@ -52,18 +103,12 @@ module private DocDbExtensions =
             | DocDbException (DocDbStatusCode System.Net.HttpStatusCode.PreconditionFailed as e) -> return e.RequestCharge, NotModified }
 
 module Store =
-    open System.IO
-    open System.IO.Compression
-    [<NoComparison>]
-    type Position =
-        {   collectionUri: Uri; streamName: string; index: int64 option; etag: string option }
-        member __.Index : int64 = defaultArg __.index -1L
-        member __.IndexRel (offset: int) : int64 = __.index |> function
-            | Some index -> index+int64 offset
-            | None -> failwithf "Cannot IndexRel %A" __
-
-    type EventData = { eventType: string; data: byte[]; metadata: byte[] }
+    /// Pending or Batched events and projections all map to this form
     type IEventData =
+        /// Indicates whether this is a primary event or a projection based on the events <= up to `Index`
+        abstract member IsProjection: bool
+        /// The index into the event sequence of this event
+        abstract member Index : int64
         /// The Event Type, used to drive deserialization
         abstract member EventType : string
         /// Event body, as UTF-8 encoded json ready to be injected into the Json being rendered for DocDb
@@ -71,24 +116,10 @@ module Store =
         /// Optional metadata (null, or same as d, not written if missing)
         abstract member MetaUtf8 : byte[]
 
+    /// A single event from the array held in a batch
     [<NoEquality; NoComparison; JsonObject(ItemRequired=Required.Always)>]
-    type Event =
-        {   (* DocDb-mandated essential elements *)
-
-            // DocDb-mandated Partition Key, must be maintained within the document
-            // Not actually required if running in single partition mode, but for simplicity, we always write it
-            p: string // "{streamName}"
-
-            // DocDb-mandated unique row key; needs to be unique within any partition it is maintained; must be a string
-            // At the present time, one can't perform an ORDER BY on this field, hence we also have i, which is identical
-            id: string // "{index}"
-
-            // Same as `id`; necessitated by fact that it's not presently possible to do an ORDER BY on the row key
-            i: int64 // {index}
-
-            (* Event payload elements *)
-
-            /// Creation date (as opposed to sytem-defined _lastUpdated which is rewritten by triggers adnd/or replication)
+    type BatchEvent =
+        {   /// Creation date (as opposed to sytem-defined _lastUpdated which is rewritten by triggers adnd/or replication)
             c: DateTimeOffset // ISO 8601
 
             /// The Event Type, used to drive deserialization
@@ -101,134 +132,105 @@ module Store =
             /// Optional metadata (null, or same as d, not written if missing)
             [<JsonConverter(typeof<VerbatimUtf8JsonConverter>); JsonProperty(Required=Required.Default, NullValueHandling=NullValueHandling.Ignore)>]
             m: byte[] } // optional
+    /// Allow reader to enumerate the events in a batch
+    let private enumEvents (batch : BatchEvent[]) baseIndex = seq {
+        for offset = 0 to batch.Length do
+            let x = batch.[offset]
+            let eventIndex = baseIndex + int64 offset
+            yield { new IEventData with
+                member __.Index = eventIndex
+                member __.IsProjection = false
+                member __.EventType = x.t
+                member __.DataUtf8 = x.d
+                member __.MetaUtf8 = x.m } }
+
+    /// A standard frozen (not Pending) batch
+    [<NoEquality; NoComparison; JsonObject(ItemRequired=Required.Always)>]
+    type Batch =
+        {   // DocDb-mandated Partition Key, must be maintained within the document
+            // Not actually required if running in single partition mode, but for simplicity, we always write it
+            p: string // "{streamName}"
+
+            // DocDb-mandated unique row key; needs to be unique within any partition it is maintained; must be a string
+            // At the present time, one can't perform an ORDER BY on this field, hence we also have i, which is identical
+            id: string // "{index}"
+
+            // Same as `id`; necessitated by fact that it's not presently possible to do an ORDER BY on the row key
+            i: int64 // {index}
+
+            /// The events at this offset in the stream
+            e: BatchEvent [] }
         /// Unless running in single partion mode (which would restrict us to 10GB per collection)
         /// we need to nominate a partition key that will be in every document
         static member PartitionKeyField = "p"
         /// As one cannot sort by the implicit `id` field, we have an indexed `i` field which we use for sort and range query purporses
-        static member IndexedFields = [Event.PartitionKeyField; "i"]
-        static member Create (pos: Position) offset (ed: EventData) : Event =
-            {   p = pos.streamName; id = string (pos.IndexRel offset); i = pos.IndexRel offset
-                c = DateTimeOffset.UtcNow
-                t = ed.eventType; d = ed.data; m = ed.metadata }
-        interface IEventData with
-            member __.EventType = __.t
-            member __.DataUtf8 = __.d
-            member __.MetaUtf8 = __.m
+        static member IndexedFields = [Batch.PartitionKeyField; "i"]
 
-    /// Manages injecting prepared json into the data being submitted to DocDb as-is, on the basis we can trust it to be valid json as DocDb will need it to be
-    and VerbatimUtf8JsonConverter() =
-        inherit JsonConverter()
+    /// Projection based on thst state at a given point in time `i`
+    and [<CLIMutable>] Projection =
+        {   /// Base: Max index rolled into this projection
+            i: int64
 
-        override __.ReadJson(reader, _, _, _) =
-            let token = JToken.Load(reader)
-            if token.Type = JTokenType.Object then token.ToString() |> System.Text.Encoding.UTF8.GetBytes |> box
-            else Array.empty<byte> |> box
-
-        override __.CanConvert(objectType) =
-            typeof<byte[]>.Equals(objectType)
-
-        override __.WriteJson(writer, value, serializer) =
-            let array = value :?> byte[]
-            if array = null || Array.length array = 0 then serializer.Serialize(writer, null)
-            else writer.WriteRawValue(System.Text.Encoding.UTF8.GetString(array))
-
-    [<NoEquality; NoComparison; JsonObject(ItemRequired=Required.Always)>]
-    type IndexEvent =
-        {   p: string // "{streamName}"
-            id: string // "{-1}"
-
-            /// When we read, we need to capture the value so we can retain it for caching purposes; when we write, there's no point sending it as it would not be honored
-            [<JsonProperty(DefaultValueHandling=DefaultValueHandling.Ignore,Required=Required.Default)>]
-            _etag: string
-
-            //w: int64 // 100: window size
-            /// last index/i value
-            m: int64 // {index}
-
-            /// Compacted projections based on version identified by `m`
-            c: IndexProjection[]
-
-            (*// Potential schema to manage Pending Events together with compaction events based on each one
-              // This scheme is more complete than the simple `c` encoding, which relies on every writer being able to write all salient snapshots
-              // For instance, in the case of blue/green deploys, older versions need to be able to coexist without destroying the perf for eachother
-              "x": [
-                { "i":0,
-                  "c":"ISO 8601"
-                  "e":[
-                    [{"t":"added","d":"..."},{"t":"compacted/1","d":"..."}],
-                    [{"t":"removed","d":"..."}],
-                  ]
-                }
-              ] *)
-            //x: JObject[][]
-            }
-        static member IdConstant = "-1"
-        static member Create (pos: Position) eventCount (eds: EventData[]) : IndexEvent =
-            {   p = pos.streamName; id = IndexEvent.IdConstant; m = pos.IndexRel eventCount; _etag = null
-                c = [| for ed in eds -> { t = ed.eventType; d = ed.data; m = ed.metadata } |] }
-    and [<CLIMutable>] IndexProjection =
-        {   /// The Event Type, used to drive deserialization
+            /// The Event Type of this compaction/snapshot, used to drive deserialization
             t: string // required
 
-            /// Event body, as UTF-8 encoded json ready to be injected into the Json being rendered for DocDb
+            /// Event body - Json -> UTF-8 -> Deflate -> Base64
             [<JsonConverter(typeof<Base64ZipUtf8JsonConverter>)>]
             d: byte[] // required
 
             /// Optional metadata (null, or same as d, not written if missing)
             [<JsonConverter(typeof<Base64ZipUtf8JsonConverter>); JsonProperty(Required=Required.Default, NullValueHandling=NullValueHandling.Ignore)>]
             m: byte[] } // optional
-        interface IEventData with
-            member __.EventType = __.t
-            member __.DataUtf8 = __.d
-            member __.MetaUtf8 = __.m
+    let private enumProjections (projections : Projection[]) = seq {
+        for x in projections -> { new IEventData with
+            member __.Index = x.i
+            member __.IsProjection = true
+            member __.EventType = x.t
+            member __.DataUtf8 = x.d
+            member __.MetaUtf8 = x.m } }
 
-    /// Manages zipping of the UTF-8 json bytes to make the index record minimal from the perspective of the writer stored proc
-    /// Only applied to snapshots in the Index
-    and Base64ZipUtf8JsonConverter() =
-        inherit JsonConverter()
-        let pickle (input : byte[]) : string =
-            if input = null then null else
+    [<NoComparison>]
+    type Position =
+        {   collectionUri: Uri; streamName: string; index: int64 option; etag: string option }
+        member __.Index : int64 = defaultArg __.index -1L
+        member __.IndexRel (offset: int) : int64 = __.index |> function
+            | Some index -> index+int64 offset
+            | None -> failwithf "Cannot IndexRel %A" __
 
-            use output = new MemoryStream()
-            use compressor = new DeflateStream(output, CompressionLevel.Optimal)
-            compressor.Write(input,0,input.Length)
-            compressor.Close()
-            Convert.ToBase64String(output.ToArray())
-        let unpickle str : byte[] =
-            if str = null then null else
+    ///// Events being sent to the SP for writing
+    type [<CLIMutable>] EventData = { eventType: string; data: byte[]; metadata: byte[] }
 
-            let compressedBytes = Convert.FromBase64String str
-            use input = new MemoryStream(compressedBytes)
-            use decompressor = new DeflateStream(input, CompressionMode.Decompress)
-            use output = new MemoryStream()
-            decompressor.CopyTo(output)
-            decompressor.Close()
-            output.ToArray()
+    /// The Special 'Pending' Batch
+    /// a) `id` = `-1`
+    /// b) contains projections (`c`)
+    [<NoEquality; NoComparison; JsonObject(ItemRequired=Required.Always)>]
+    type WipBatch =
+        {   p: string // "{streamName}"
+            id: string // "{-1}" while this is the pending batch
 
-        override __.CanConvert(objectType) =
-            typeof<byte[]>.Equals(objectType)
-        override __.ReadJson(reader, _, _, serializer) =
-            //(   if reader.TokenType = JsonToken.Null then null else
-            serializer.Deserialize(reader, typedefof<string>) :?> string |> unpickle |> box
-        override __.WriteJson(writer, value, serializer) =
-            let pickled = value |> unbox |> pickle
-            serializer.Serialize(writer, pickled)
+            /// When we read, we need to capture the value so we can retain it for caching purposes; when we write, there's no point sending it as it would not be honored
+            [<JsonProperty(DefaultValueHandling=DefaultValueHandling.Ignore,Required=Required.Default)>]
+            _etag: string
 
-    (* Pseudocode:
-    function sync(p, expectedVersion, windowSize, events) {
-        if (i == 0) then {
-            coll.insert(p,0,{ p:p, id:-1, w:windowSize, m:flatLen(events)})
-        } else {
-            const i = doc.find(p=p && id=-1)
-            if(i.m <> expectedVersion) then emit from expectedVersion else
-            i.x.append(events)
-            for (var (i, c, e: [ {e1}, ...]) in events) {
-                coll.insert({p:p, id:i, i:i, c:c, e:e1)
-            }
-            // trim i.x to w total items in i.[e]
-            coll.update(p,id,i)
-        }
-    } *)
+            /// base 'i' value for the Events held herein
+            i: int64 // {index}
+
+            /// Events
+            e: BatchEvent[]
+
+            /// Projections
+            c: Projection[] }
+        /// TOCONSIDER maybe this should be a high nember to reflect fact it is the freshest ?
+        static member IdConstant = "-1"
+        static member Create (pos: Position) (events: IEventData[]) (projections: IEventData seq) : WipBatch =
+            {   p = pos.streamName; id = WipBatch.IdConstant; i = pos.Index; _etag = null
+                e = [| for ed in events -> { c = DateTimeOffset.UtcNow; t = ed.EventType; d = ed.DataUtf8; m = ed.MetaUtf8 } |]
+                c = [| for ed in projections -> { i = pos.IndexRel events.Length; t = ed.EventType; d = ed.DataUtf8; m = ed.MetaUtf8 } |] }
+        member __.EnumEventsAndProjections : IEventData seq =
+            enumEvents __.e __.i
+            |> Seq.append (enumProjections __.c)
+            |> Seq.sortBy (fun x -> x.Index, x.IsProjection) // projections go after the events
+
 [<RequireQualifiedAccess>]
 type Direction = Forward | Backward with
     override this.ToString() = match this with Forward -> "Forward" | Backward -> "Backward"
@@ -254,14 +256,8 @@ module Log =
     let propEvents name (kvps : System.Collections.Generic.KeyValuePair<string,string> seq) (log : ILogger) =
         let items = seq { for kv in kvps do yield sprintf "{\"%s\": %s}" kv.Key kv.Value }
         log.ForContext(name, sprintf "[%s]" (String.concat ",\n\r" items))
-    let propEventData name (events : Store.EventData[]) (log : ILogger) =
-        log |> propEvents name (seq { for x in events -> Collections.Generic.KeyValuePair<_,_>(x.eventType, System.Text.Encoding.UTF8.GetString x.data)})
-    let propResolvedEvents name (events : Store.Event[]) (log : ILogger) =
-        log |> propEvents name (seq { for x in events -> Collections.Generic.KeyValuePair<_,_>(x.t, System.Text.Encoding.UTF8.GetString x.d)})
-    let propIEventDatas name (events : Store.IEventData[]) (log : ILogger) =
+    let propEventData name (events : Store.IEventData[]) (log : ILogger) =
         log |> propEvents name (seq { for x in events -> Collections.Generic.KeyValuePair<_,_>(x.EventType, System.Text.Encoding.UTF8.GetString x.DataUtf8)})
-    let propProjectionEvents name (events : Store.IndexProjection[]) (log : ILogger) =
-        log |> propEvents name (seq { for x in events -> Collections.Generic.KeyValuePair<_,_>(x.t, System.Text.Encoding.UTF8.GetString x.d)})
 
     open Serilog.Events
     /// Attach a property to the log context to hold the metrics
@@ -287,27 +283,23 @@ type EqxSyncResult =
 
 // NB don't nest in a private module, or serialization will fail miserably ;)
 [<CLIMutable; NoEquality; NoComparison; JsonObject(ItemRequired=Required.AllowNull)>]
-type WriteResponse = { etag: string; conflicts: Store.IndexProjection[] }
+type WriteResponse = { etag: string; conflicts: Store.EventData[] }
 
 module private Write =
     let [<Literal>] sprocName = "EquinoxIndexedWrite"
 
-    let private writeEventsAsync (client: IDocumentClient) (pos: Store.Position) (events: Store.EventData seq,maybeIndexEvents): Async<float*EqxSyncResult> = async {
+    let private writeEventsAsync (client: IDocumentClient) (pos: Store.Position) (events: Store.IEventData[],projections:Store.IEventData seq): Async<float*EqxSyncResult> = async {
         let sprocLink = sprintf "%O/sprocs/%s" pos.collectionUri sprocName
         let opts = Client.RequestOptions(PartitionKey=PartitionKey(pos.streamName))
         let! ct = Async.CancellationToken
-        let events = events |> Seq.mapi (fun i ed -> Store.Event.Create pos (i+1) ed |> JsonConvert.SerializeObject) |> Seq.toArray
         if events.Length = 0 then invalidArg "eventsData" "must be non-empty"
-        let index : Store.IndexEvent =
-            match maybeIndexEvents with
-            | None | Some [||] -> Unchecked.defaultof<_>
-            | Some eds -> Store.IndexEvent.Create pos (events.Length) eds
+        let req = Store.WipBatch.Create pos events projections
         try
-            let! (res : Client.StoredProcedureResponse<WriteResponse>) = client.ExecuteStoredProcedureAsync(sprocLink, opts, ct, box events, box pos.Index, box pos.etag, box index) |> Async.AwaitTaskCorrect
+            let! (res : Client.StoredProcedureResponse<WriteResponse>) = client.ExecuteStoredProcedureAsync(sprocLink, opts, ct, box req, box pos.etag) |> Async.AwaitTaskCorrect
             match res.RequestCharge, (match res.Response.etag with null -> None | x -> Some x), res.Response.conflicts with
             | rc,e,null -> return rc, EqxSyncResult.Written { pos with index = Some (pos.IndexRel events.Length); etag=e }
             | rc,e,[||] -> return rc, EqxSyncResult.ConflictUnknown { pos with etag=e }
-            | rc,e, xs  -> return rc, EqxSyncResult.Conflict ({ pos with index = Some (pos.IndexRel xs.Length); etag=e }, Array.map (fun x -> x :> _) xs)
+            | rc,e, xs  -> return rc, EqxSyncResult.Conflict ({ pos with index = Array.max xs Some (pos.IndexRel xs.Length); etag=e })
         with DocDbException ex when ex.Message.Contains "already" -> // TODO this does not work for the SP
             return ex.RequestCharge, EqxSyncResult.ConflictUnknown { pos with etag=None } }
 
